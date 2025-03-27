@@ -5,4 +5,5 @@ pub use sensors::{
     poll_barometer,
     poll_imu,
     poll_gps,
+    poll_radio,
 };

@@ -1,5 +1,7 @@
 use flight_builder::prelude::*;
 use std::{ptr::read, time::{Duration, Instant}};
+use log::*;
+
 #[derive(Copy, Clone)]
 enum FlightStates{
     Init, // Initialization. Make sure that the radio's connected and that we're ready to start flying. 
@@ -57,31 +59,56 @@ fn states(mut state: ResMut<State>){ // Run the functia corresponding to each st
 }
 
 fn find_sink_rate(mut state: ResMut<State>){ // Use the ends of the barometric altitude / timestamp array to calculate a sink rate (v. velocity)
-    state.sink_rate = (state.barometric_alts[19] - state.barometric_alts[0]) /
-        state.barometric_timestamps[19].duration_since(state.barometric_timestamps[0]).as_secs_f32();
+    state.sink_rate = (state.sink_rate + ((state.barometric_alts[19] - state.barometric_alts[0]) /
+        state.barometric_timestamps[19].duration_since(state.barometric_timestamps[0]).as_secs_f32())) / 2.0; 
+        //Average this w/ the previous value.
+        // We don't want a sudden spike causing something to get kippered up. That can still happen, but it's less likely this way.
+    new_rate = state.sink_rate;
+    info!("Vertical Velocity: {new_rate}.\n");
 }
 
 fn barometer(mut state: ResMut<State>){
-    let read_value = poll_barometer(); // TODO: implement this!
+    let read_value = poll_barometer();
     // Shift everything in this array right by one (except for element 0, which is overwritten,
     // and then add the new value at the end.)
     for i in 1..state.barometric_alts.len(){
         state.barometric_alts[i - 1] = state.barometric_alts[i];
     }
-    state.barometric_alts[state.barometric_alts.len()] = read_value;
+    state.barometric_alts[state.barometric_alts.len()] = 
+    (read_value + 
+    state.barometric_alts[state.barometric_alts.len() - 1] +
+    state.barometric_alts[state.barometric_alts.len() - 2] +
+    state.barometric_alts[state.barometric_alts.len() - 3] ) / 2.0;
+    // Averaging again, as an anti-kippering mechanism. This time in quadruplicate.
+
+    info!("Barometric Pressure: {new_rate}.\n");
 
     // Do it again, but for timestamps. 
     for i in 1..state.barometric_timestamps.len(){
         state.barometric_timestamps[i - 1] = state.barometric_timestamps[i];
     }
+
     state.barometric_timestamps[state.barometric_timestamps.len()] = Instant::now();
 }
 
 fn imu(mut state: ResMut<State>){
-    
+    let read_values = poll_imu();
+    let read_x = read_values.0;
+    let read_y = read_values.1;
+    let read_z = read_values.2;
+    let stored_x = (read_x + state.acceleration.0) / 2.0;
+    let stored_y = (read_y + state.acceleration.1) / 2.0;
+    let stored_z = (read_z + state.acceleration.2) / 2.0; //More con-pre-value averaging!
+    state.acceleration = read_values;
 }
 
 fn gps(mut state: ResMut<State>){
+    let read_values = poll_imu();
+    let read_x = read_values.0;
+    let read_y = read_values.1;
+    let read_z = read_values.2; // We don't do that here, though - gps data is reliable and non-critical enough that it seems a bit silly.
+    // We're gathering it mostly to log it, anyway.
+    state.acceleration = read_values;
 }
 
 const POLL_FREQ: u128 = 10000; //Frequency of polling in microseconds (10000 = 1/100 of a second, 1000 = 1/1000, et cetera.)
@@ -93,16 +120,23 @@ const POLL_FREQ: u128 = 10000; //Frequency of polling in microseconds (10000 = 1
 // Ideally, these tasks should be scheduled so that they only ever need data from the state. If they need to mutate the state somehow, we're
 // doing something wrong.
 
-fn init_tasks(state: &State) -> FlightStates{
-    return state.state;
+const LIFTOFF_DETECTION_RATE: i32 = 10;
+
+fn init_tasks(state: &State) -> FlightStates{ //...What do we need to do here?
+    return FlightStates::Grounded;
 }
 
 fn grounded_tasks(state: &State) -> FlightStates{
-    
-    return state.state;
+    if (state.acceleration <= LIFTOFF_DETECTION_RATE || state.sink_rate <= LIFTOFF_DETECTION_RATE){
+        return state.state;
+    } else {
+        info!("Launch detected! Transitioning to ascending state.");
+        return FlightStates::Ascending;
+    }
 }
 
 fn ascending_tasks(state: &State) -> FlightStates{
+    
     return state.state;
 }
 
