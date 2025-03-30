@@ -1,6 +1,7 @@
 use flight_builder::prelude::*;
-use std::{ptr::read, time::{Duration, Instant}};
+use std::{alloc::LayoutError, ptr::read, time::{Duration, Instant}};
 use log::*;
+use rppal::uart::{Parity, Uart};
 
 #[derive(Copy, Clone)]
 enum FlightStates{
@@ -16,6 +17,13 @@ enum FlightStates{
     Landed, // We're on the ground! Yahoo.
 }
 
+enum Commands{
+    LaunchRocket,
+    PopBalloon,
+    ReleaseBalloon,
+    CutDown,
+}
+
 #[derive(Copy, Clone)]
 struct State {
     state: FlightStates, // The current flight state.
@@ -26,19 +34,36 @@ struct State {
     acceleration: (f32, f32, f32), // The acceleration last polled from the IMUs.
 }
 
+struct Signals {
+    launch_rocket: bool,
+    pop_balloon: bool,
+    release_balloon: bool,
+    cut_down: bool,
+}
+
+const LOGGED_ALTS: usize = 20;
+
 fn main() {
     let mut s = Scheduler::new(); //Create a scheduling object.
 
     let state = State{ // Initialize a state object.
         state: FlightStates::Init, 
-        barometric_alts: [0.0; 20],
-        barometric_timestamps: [Instant::now(); 20],
+        barometric_alts: [0.0; LOGGED_ALTS],
+        barometric_timestamps: [Instant::now(); LOGGED_ALTS],
         sink_rate: 0.0,
         location: (0.0, 0.0, 0.0),
         acceleration: (0.0, 0.0, 0.0),
     };
 
+    let has_done = Signals{
+        launch_rocket: false,
+        pop_balloon: false,
+        release_balloon: false,
+        cut_down: false,
+    };
+
     s.add_resource(state); // Add the state as a resource.
+    s.add_resource(has_done);
 
     s.add_task(Schedule::Update(POLL_FREQ as f32 / 1000000.0), states); // Define our tasks - most of 'em don't have to run all that often!
     s.add_task(Schedule::Update(0.1), barometer);
@@ -47,11 +72,11 @@ fn main() {
     s.add_task(Schedule::Update(0.1), imu);
 }
 
-fn states(mut state: ResMut<State>){ // Run the functia corresponding to each state.
+fn states(mut state: ResMut<State>, mut has_done: ResMut<Signals>){ // Run the functia corresponding to each state.
     state.state = match state.state {
         FlightStates::Init => init_tasks(&state),
         FlightStates::Grounded => grounded_tasks(&state),
-        FlightStates::Ascending => ascending_tasks(&state),
+        FlightStates::Ascending => ascending_tasks(&state, &has_done),
         FlightStates::PostCut => post_cut_tasks(&state),
         FlightStates::Descending => descending_tasks(&state),
         FlightStates::Landed => landed_tasks(&state),
@@ -59,8 +84,8 @@ fn states(mut state: ResMut<State>){ // Run the functia corresponding to each st
 }
 
 fn find_sink_rate(mut state: ResMut<State>){ // Use the ends of the barometric altitude / timestamp array to calculate a sink rate (v. velocity)
-    state.sink_rate = (state.sink_rate + ((state.barometric_alts[19] - state.barometric_alts[0]) /
-        state.barometric_timestamps[19].duration_since(state.barometric_timestamps[0]).as_secs_f32())) / 2.0; 
+    state.sink_rate = (state.sink_rate + ((state.barometric_alts[LOGGED_ALTS - 1] - state.barometric_alts[0]) /
+        state.barometric_timestamps[LOGGED_ALTS - 1].duration_since(state.barometric_timestamps[0]).as_secs_f32())) / 2.0; 
         //Average this w/ the previous value.
         // We don't want a sudden spike causing something to get kippered up. That can still happen, but it's less likely this way.
     new_rate = state.sink_rate;
@@ -71,20 +96,20 @@ fn barometer(mut state: ResMut<State>){
     let read_value = poll_barometer();
     // Shift everything in this array right by one (except for element 0, which is overwritten,
     // and then add the new value at the end.)
-    for i in 1..state.barometric_alts.len(){
+    for i in 1..LOGGED_ALTS - 1(){
         state.barometric_alts[i - 1] = state.barometric_alts[i];
     }
-    state.barometric_alts[state.barometric_alts.len()] = 
+    state.barometric_alts[LOGGED_ALTS - 1] = 
     (read_value + 
-    state.barometric_alts[state.barometric_alts.len() - 1] +
-    state.barometric_alts[state.barometric_alts.len() - 2] +
-    state.barometric_alts[state.barometric_alts.len() - 3] ) / 2.0;
+    state.barometric_alts[LOGGED_ALTS - 2] +
+    state.barometric_alts[LOGGED_ALTS - 3] +
+    state.barometric_alts[LOGGED_ALTS - 4] ) / 4.0;
     // Averaging again, as an anti-kippering mechanism. This time in quadruplicate.
 
     info!("Barometric Pressure: {new_rate}.\n");
 
     // Do it again, but for timestamps. 
-    for i in 1..state.barometric_timestamps.len(){
+    for i in 1..LOGGED_ALTS - 1{
         state.barometric_timestamps[i - 1] = state.barometric_timestamps[i];
     }
 
@@ -135,8 +160,36 @@ fn grounded_tasks(state: &State) -> FlightStates{
     }
 }
 
-fn ascending_tasks(state: &State) -> FlightStates{
-    
+fn ascending_tasks(state: &State, has_done: &Signals) -> FlightStates{
+    let signals = Signals{
+        launch_rocket: false,
+        pop_balloon: false,
+        release_balloon: false,
+        cut_down: false,
+    }; //In futuro, this will come from some other piece of code, but I'm defining it manually here (all-false) as a temporary measure.
+    // Just remember that none of the code oughta mutate it!
+
+    if (state.barometric_alts >= LAUNCH_ALTITUDE || signals.launch_rocket && !has_done.launch_rocket){
+        info!("Either we just reached launching altitude, or we got a signal from the ground. Anyway, we're launching!");
+        send_command_to_board(Commands::LaunchRocket, 0);
+        has_done.launch_rocket = true;
+    }
+    if (has_done.launch_rocket){ //These check that we're *below* a certain barom. alt. - but shouldn't be done 'till the rocket goes!
+        if (state.barometric_alts[LOGGED_ALTS - 1] <= POP_ALTITUDE || signals.pop_balloon && !has_done.pop_balloon){
+            info!("We're popping the balloon!");
+            send_command_to_board(Commands::PopBalloon, 0);
+            has_done.pop_balloon = true;
+        }
+        if (state.barometric_alts[LOGGED_ALTS - 1] <= RELEASE_ALTITUDE || signals.release_balloon && !has_done.release_balloon){
+            info!("Letting the balloon go!");
+            send_command_to_board(Commands::ReleaseBalloon, 0);
+            has_done.release_balloon = true;
+        }
+    }
+    if (signals.cut_down && !has_done.cut_down){
+        send_command_to_board(Commands::CutDown, 0);
+        has_done.cut_down = true;
+    }
     return state.state;
 }
 
@@ -152,4 +205,24 @@ fn landed_tasks(state: &State) -> FlightStates{
     return state.state;
 }
 
-// Savaz aguaz di masu feixandu feran, ia promesa di fida no teu corasan.
+const BAUD_RATE: u32 = 19200;
+fn send_command_to_board(command: Commands, tries: u8){
+    let uart = Uart::new(BAUD_RATE, Parity::None, 8, 1)?;
+    let sent_packet: [u8] = [Commands as u8];
+    let write_result = uart.write(&sent_packet);
+    match write_result{
+        Err(error) => {
+            if (tries <= 10){
+                warn!("Error communicating with board!! {error}");
+                send_command_to_board(command, tries + 1);
+            } else {
+                warn!("Ten consecutive failed communications with board! Aborting communication attempt!");
+                return;
+            }
+        },
+        _ => return,
+    }
+}
+
+// A, pehdaun - e a makina, e'a kohasaun
+// A ki faj a hicmu, a hima, i a tuda kada pahci du kansaun.
