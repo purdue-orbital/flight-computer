@@ -8,6 +8,12 @@ use embedded_hal::spi::SpiDevice;
 use rppal::spi::{Bus, SlaveSelect, Spi};
 use log::*;
 use rppal::i2c::I2c;
+use std::sync::mpsc::{
+    self,
+    Receiver,
+    RecvError,
+    Sender,
+};
 
 pub type Mpu9250Device = Mpu9250<Spi, Marg>;
 
@@ -25,10 +31,82 @@ pub fn init_sensors() -> (Bmp280, Mpu9250Device, GPSDevice) {
 
     let gps = initialize_gps().expect("GPS init failed");
 
-    (baro, mpu, gps)
+    let (gps_tx, gps_rx) = mpsc::channel();
+
+    spawn_gps_thread(gps, gps_tx).expect("Failed to spawn GPS thread");
+
+    (baro, mpu, gps_rx)
 }
 
-fn get_all_mpu(mpu: &mut Mpu9250Device) -> Result<(f32, (f32, f32, f32), (f32, f32, f32)), std::io::Error> {
+fn spawn_gps_thread(gps: GPSDevice, gps_tx: Sender<(f32, f32, f32)>) {
+    std::thread::spawn(move || {
+        let mut last_packet = Instant::now();
+        loop {
+            gps
+                .update(|packet| match packet {
+                    PacketRef::MonVer(packet) => {
+                        debug!(
+                            "SW version: {} HW version: {}; Extensions: {:?}",
+                            packet.software_version(),
+                            packet.hardware_version(),
+                            packet.extension().collect::<Vec<&str>>()
+                        );
+                        debug!("{:?}", packet);
+                    },
+                    PacketRef::NavPvt(sol) => {
+                        let has_time = sol.fix_type() == GpsFix::Fix3D
+                            || sol.fix_type() == GpsFix::GPSPlusDeadReckoning
+                            || sol.fix_type() == GpsFix::TimeOnlyFix;
+                        let has_posvel = sol.fix_type() == GpsFix::Fix3D
+                            || sol.fix_type() == GpsFix::GPSPlusDeadReckoning;
+    
+                        if has_posvel {
+                            let pos: Position = (&sol).into();
+                            let vel: Velocity = (&sol).into();
+                            // println!(
+                            //     "Latitude: {:.5} Longitude: {:.5} Altitude: {:.2}m",
+                            //     pos.lat, pos.lon, pos.alt
+                            // );
+                            // println!(
+                            //     "Speed: {:.2} m/s Heading: {:.2} degrees",
+                            //     vel.speed, vel.heading
+                            // );
+                            match gps_tx.send((pos.lat, pos.lon, pos.alt)).expect("gps tx channel to be open") {
+                                Ok(_) => {}
+                                Err(mpsc::SendError(_)) => {
+                                    error!("GPS data failed to send from GPS thread");
+                                }
+                            }
+                            info!("TELEMETRY: Lat {:.5} Long {:5} Alt {:.2} m Spd {:.2} m/s Head {:.2} deg", pos.lat, pos.lon, pos.alt, vel.speed, vel.heading);
+                            // println!("Sol: {:?}", sol);
+                            last_packet = Instant::now();
+                        }
+    
+                        if has_time {
+                            let time: DateTime<Utc> = (&sol)
+                                .try_into()
+                                .expect("Could not parse NAV-PVT time field to UTC");
+                            info!("GPS TIME (UTC): {:?}", time);
+                        }
+                    },
+                    _ => {
+                        println!("{:?}", packet);
+                    },
+                })
+                .unwrap();
+
+            if Instant::now() > last_packet + Duration::from_millis(600 * 1000) && !state.read().expect("shared state read").cut_done
+            {
+                info!("No GPS for over 10 minutes! Cutting down.");
+                gpio_actions.send(GpioAction::Drop(None)).expect("gpio action channel to be open");
+            }
+        }
+
+        info!("GPS Shutdown");
+    });
+}
+
+fn get_all_mpu(mpu: &mut Mpu9250Device) -> Result<(f32, (f32, f32, f32), (f32, f32, f32)), rppal::spi::Error> {
     let readings = mpu.all()?;
     Ok( (readings.temp, readings.gyro, readings.accel) )
 }
@@ -40,18 +118,25 @@ fn get_baro_readings(baro: &mut Bmp280) -> Result<(f32, f32, f32), rppal::i2c::E
     Ok( (temp, pressure, altitude) )
 }
 
-fn get_gps_readings(gps: &mut GPSDevice) -> Result<(f32, f32, f32), std::io::Error> {
+fn get_gps_readings(gps_rx: Receiver<(f32, f32, f32)>) -> Option<(f32, f32, f32)> {
     let mut lat = 0.0;
     let mut lon = 0.0;
     let mut alt = 0.0;
 
-    gps.update(|packet| {
-        if let PacketRef::NavPvt(nav) = packet {
-            lat = nav.lat as f32 / 1e7;
-            lon = nav.lon as f32 / 1e7;
-            alt = nav.height as f32 / 1e3;
+    result = gps_rx.try_recv();
+    match Result {
+        Ok((lat, lon, alt)) => {
+            info!("GPS: Lat {:.5} Long {:5} Alt {:.2} m", lat, lon, alt);
         }
-    })?;
+        Err(mpsc::TryRecvError::Empty) => {
+            // No data available
+            return None;
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            // Channel disconnected
+            return None;
+        }        
+    }
 
     Ok( (lat, lon, alt) )
 }
