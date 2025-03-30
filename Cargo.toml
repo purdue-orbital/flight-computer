@@ -7,6 +7,7 @@ edition = "2021"
 flight-builder = {git = "https://github.com/purdue-orbital/flight-builder"}
 bmp280 = "0.4.0"
 mpu9250 = "0.25.0"
-ublox = "0.4.4"
+ublox = "0.5.0"
 log = "0.4.27"
 rppal = "0.22.1"
+
