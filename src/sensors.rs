@@ -33,7 +33,7 @@ pub fn init_sensors() -> (Bmp280, Mpu9250Device, GPSDevice) {
 
     let (gps_tx, gps_rx) = mpsc::channel();
 
-    spawn_gps_thread(gps, gps_tx).expect("Failed to spawn GPS thread");
+    spawn_gps_thread(gps, gps_tx);
 
     (baro, mpu, gps_rx)
 }
@@ -71,7 +71,7 @@ fn spawn_gps_thread(gps: GPSDevice, gps_tx: Sender<(f32, f32, f32)>) {
                             //     "Speed: {:.2} m/s Heading: {:.2} degrees",
                             //     vel.speed, vel.heading
                             // );
-                            match gps_tx.send((pos.lat, pos.lon, pos.alt)).expect("gps tx channel to be open") {
+                            match gps_tx.send((pos.lat, pos.lon, pos.alt)) {
                                 Ok(_) => {}
                                 Err(mpsc::SendError(_)) => {
                                     error!("GPS data failed to send from GPS thread");
@@ -86,7 +86,16 @@ fn spawn_gps_thread(gps: GPSDevice, gps_tx: Sender<(f32, f32, f32)>) {
                             let time: DateTime<Utc> = (&sol)
                                 .try_into()
                                 .expect("Could not parse NAV-PVT time field to UTC");
-                            info!("GPS TIME (UTC): {:?}", time);
+
+                            let time_result: Result<DateTime<Utc>, _> = time.try_into();
+                            match time_result {
+                                Ok(time) => {
+                                    info!("GPS TIME (UTC): {:?}", time);
+                                }
+                                Err(_) => {
+                                    error!("Failed to parse GPS time");
+                                }
+                            }
                         }
                     },
                     _ => {
