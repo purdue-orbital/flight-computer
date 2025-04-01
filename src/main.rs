@@ -29,7 +29,7 @@ struct State {
     state: FlightStates, // The current flight state.
     barometric_alts: [f32; 20], // The last twenty read barometric altitudes.
     barometric_timestamps: [Instant; 20], // The timestamps these altitudes were read at (should be uniform, but you never know!)
-    sink_rate: f32, // The calculated vertical velocity from the previous two entries.
+    sink_rates: [f32; 20], // The calculated vertical velocity from the previous two entries.
     location: (f32, f32, f32), // The location last polled from the GPS.
     acceleration: (f32, f32, f32), // The acceleration last polled from the IMUs.
 }
@@ -50,7 +50,7 @@ fn main() {
         state: FlightStates::Init, 
         barometric_alts: [0.0; LOGGED_ALTS],
         barometric_timestamps: [Instant::now(); LOGGED_ALTS],
-        sink_rate: 0.0,
+        sink_rates: [0.0; 32],
         location: (0.0, 0.0, 0.0),
         acceleration: (0.0, 0.0, 0.0),
     };
@@ -84,11 +84,14 @@ fn states(mut state: ResMut<State>, mut has_done: ResMut<Signals>){ // Run the f
 }
 
 fn find_sink_rate(mut state: ResMut<State>){ // Use the ends of the barometric altitude / timestamp array to calculate a sink rate (v. velocity)
-    state.sink_rate = (state.sink_rate + ((state.barometric_alts[LOGGED_ALTS - 1] - state.barometric_alts[0]) /
-        state.barometric_timestamps[LOGGED_ALTS - 1].duration_since(state.barometric_timestamps[0]).as_secs_f32())) / 2.0; 
+    for i in 1..LOGGED_ALTS - 1(){
+        state.sink_rates[i - 1] = state.sink_rates[i];
+    }
+    state.sink_rates[LOGGED_ALTS - 1] = ((state.barometric_alts[LOGGED_ALTS - 1] - state.barometric_alts[0]) /
+        state.barometric_timestamps[LOGGED_ALTS - 1].duration_since(state.barometric_timestamps[0]).as_secs_f32()); 
         //Average this w/ the previous value.
         // We don't want a sudden spike causing something to get kippered up. That can still happen, but it's less likely this way.
-    new_rate = state.sink_rate;
+    new_rate = state.sink_rates[LOGGED_ALTS - 1];
     info!("Vertical Velocity: {new_rate}.\n");
 }
 
@@ -194,10 +197,20 @@ fn ascending_tasks(state: &State, has_done: &Signals) -> FlightStates{
 }
 
 fn post_cut_tasks(state: &State) -> FlightStates{
+    if (state.sink_rates[LOGGED_ALTS - 1] - state.sink_rates[LOGGED_ALTS - 2]) 
+    + (state.sink_rates[LOGGED_ALTS - 2] - state.sink_rates[LOGGED_ALTS - 3]).abs() <= 0.1{
+        info!("Constant vertical descent rate reached, transitioning to descent phase...");
+        return FlightStates::Descending;
+    }
     return state.state;
 }
 
 fn descending_tasks(state: &State) -> FlightStates{
+    if (state.sink_rates[LOGGED_ALTS - 1] + state.sink_rates[LOGGED_ALTS - 2]) 
+    + state.sink_rates[LOGGED_ALTS - 3] <= 0.1{
+        info!("Landing detected!");
+        return FlightStates::Landed;
+    }
     return state.state;
 }
 
