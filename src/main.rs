@@ -1,4 +1,5 @@
 use flight_builder::prelude::*;
+use flight_computer::poll_gps;
 use std::{ptr::read, time::{Duration, Instant}};
 use log::*;
 
@@ -38,13 +39,18 @@ fn main() {
         acceleration: (0.0, 0.0, 0.0),
     };
 
+    let (mpu, baro, gps) = init_sensors();
+    
+    s.add_resource(mpu); // Add the IMU as a resource.
+    s.add_resource(baro); // Add the barometer as a resource.
+    s.add_resource(gps); // Add the GPS as a resource.
     s.add_resource(state); // Add the state as a resource.
 
     s.add_task(Schedule::Update(POLL_FREQ as f32 / 1000000.0), states); // Define our tasks - most of 'em don't have to run all that often!
-    s.add_task(Schedule::Update(0.1), barometer);
-    s.add_task(Schedule::Update(0.1), find_sink_rate);
-    s.add_task(Schedule::Update(1.0), gps);
-    s.add_task(Schedule::Update(0.1), imu);
+    s.add_task(Schedule::Update(0.01), barometer);
+    s.add_task(Schedule::Update(0.01), find_sink_rate);
+    s.add_task(Schedule::Update(0.01), gps);
+    s.add_task(Schedule::Update(0.01), imu);
 }
 
 fn states(mut state: ResMut<State>){ // Run the functia corresponding to each state.
@@ -67,8 +73,8 @@ fn find_sink_rate(mut state: ResMut<State>){ // Use the ends of the barometric a
     info!("Vertical Velocity: {new_rate}.\n");
 }
 
-fn barometer(mut state: ResMut<State>){
-    let read_value = poll_barometer();
+fn barometer(mut state: ResMut<State>, mut baro: ResMut<BaroData>){ // Read the barometer and update the state.
+    let read_value = poll_barometer(&mut baro);
     // Shift everything in this array right by one (except for element 0, which is overwritten,
     // and then add the new value at the end.)
     for i in 1..state.barometric_alts.len(){
@@ -91,8 +97,8 @@ fn barometer(mut state: ResMut<State>){
     state.barometric_timestamps[state.barometric_timestamps.len()] = Instant::now();
 }
 
-fn imu(mut state: ResMut<State>){
-    let read_values = poll_imu();
+fn imu(mut state: ResMut<State>, mut mpu: ResMut<MpuData>){
+    let read_values = poll_imu(&mut mpu);
     let read_x = read_values.0;
     let read_y = read_values.1;
     let read_z = read_values.2;
@@ -102,8 +108,8 @@ fn imu(mut state: ResMut<State>){
     state.acceleration = read_values;
 }
 
-fn gps(mut state: ResMut<State>){
-    let read_values = poll_imu();
+fn gps(mut state: ResMut<State>, mut gps: ResMut<Receiver<(f32, f32, f32)>>){
+    let read_values = poll_gps(&mut gps);
     let read_x = read_values.0;
     let read_y = read_values.1;
     let read_z = read_values.2; // We don't do that here, though - gps data is reliable and non-critical enough that it seems a bit silly.

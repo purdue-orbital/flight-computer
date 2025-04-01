@@ -1,316 +1,158 @@
-use ublox::*;
-use ublox::{
-    CfgPrtUartBuilder, DataBits, InProtoMask, OutProtoMask, Parity, StopBits, UartMode, UartPortId,
-};
-use mpu9250::{Mpu9250, Marg};
-use bmp280::{Bmp280, Bmp280Builder};
-use embedded_hal::spi::SpiDevice;
-use rppal::spi::{Bus, SlaveSelect, Spi};
 use log::*;
-use rppal::i2c::I2c;
+use std::iter::Rev;
 use std::sync::mpsc::{
     self,
     Receiver,
-    RecvError,
+    TryRecvError,
     Sender,
 };
 
-pub type Mpu9250Device = Mpu9250<Spi, Marg>;
+use std::fs::File;
+use std::io;
+use std::io::prelude::*;
 
-pub fn init_sensors() -> (Bmp280, Mpu9250Device, GPSDevice) {
-    let baro = Bmp280Builder::new()
-        .path("/dev/i2c-1")
-        .address(0x76)
-        .build()
-        .expect("BMP280 init");
-
-    let mut spi = rppal::spi::Spi::new(rppal::spi::Bus::Spi1, rppal::spi::SlaveSelect::Ss0, 8_000_000, rppal::spi::Mode::Mode0).expect("SPI init");
-    let cs = rppal::gpio::Gpio::new().expect("gpio init").get(27).expect("chip select pin").into_output(); // TODO: which pin is chip select pin for spi1
-    let delay = Delay::new();
-    let mpu = Mpu9250::marg_default(spi, cs, &mut delay).expect("MPU9250 init");
-
-    let gps = initialize_gps().expect("GPS init failed");
+/// returns sensor handles: (mpu, barometer, gps)
+pub fn init_sensors() -> (MpuData, BaroData, Receiver<(f32, f32, f32)>) {
+    let mpu_file = File::open("mpu_data.txt").unwrap();
+    let baro_file = File::open("baro_data.txt").unwrap();
+    let gps_file = File::open("gps_data.txt").unwrap();
 
     let (gps_tx, gps_rx) = mpsc::channel();
 
-    spawn_gps_thread(gps, gps_tx);
-
-    (baro, mpu, gps_rx)
-}
-
-fn spawn_gps_thread(gps: GPSDevice, gps_tx: Sender<(f32, f32, f32)>) {
     std::thread::spawn(move || {
-        let mut last_packet = Instant::now();
         loop {
-            gps
-                .update(|packet| match packet {
-                    PacketRef::MonVer(packet) => {
-                        debug!(
-                            "SW version: {} HW version: {}; Extensions: {:?}",
-                            packet.software_version(),
-                            packet.hardware_version(),
-                            packet.extension().collect::<Vec<&str>>()
-                        );
-                        debug!("{:?}", packet);
-                    },
-                    PacketRef::NavPvt(sol) => {
-                        let has_time = sol.fix_type() == GpsFix::Fix3D
-                            || sol.fix_type() == GpsFix::GPSPlusDeadReckoning
-                            || sol.fix_type() == GpsFix::TimeOnlyFix;
-                        let has_posvel = sol.fix_type() == GpsFix::Fix3D
-                            || sol.fix_type() == GpsFix::GPSPlusDeadReckoning;
-    
-                        if has_posvel {
-                            let pos: Position = (&sol).into();
-                            let vel: Velocity = (&sol).into();
-                            // println!(
-                            //     "Latitude: {:.5} Longitude: {:.5} Altitude: {:.2}m",
-                            //     pos.lat, pos.lon, pos.alt
-                            // );
-                            // println!(
-                            //     "Speed: {:.2} m/s Heading: {:.2} degrees",
-                            //     vel.speed, vel.heading
-                            // );
-                            match gps_tx.send((pos.lat, pos.lon, pos.alt)) {
-                                Ok(_) => {}
-                                Err(mpsc::SendError(_)) => {
-                                    error!("GPS data failed to send from GPS thread");
-                                }
-                            }
-                            info!("TELEMETRY: Lat {:.5} Long {:5} Alt {:.2} m Spd {:.2} m/s Head {:.2} deg", pos.lat, pos.lon, pos.alt, vel.speed, vel.heading);
-                            // println!("Sol: {:?}", sol);
-                            last_packet = Instant::now();
-                        }
-    
-                        if has_time {
-                            let time: DateTime<Utc> = (&sol)
-                                .try_into()
-                                .expect("Could not parse NAV-PVT time field to UTC");
+            let mut contents = String::new();
+            gps_file.read_to_string(&mut contents).unwrap();
+            for line in contents.split('\n') {
+                let line = line.unwrap();
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 5 {
+                    let lat: f32 = parts[0].parse().unwrap();
+                    let lon: f32 = parts[1].parse().unwrap();
+                    let alt: f32 = parts[2].parse().unwrap();
+                    let speed: f32 = parts[3].parse().unwrap();
+                    let heading: f32 = parts[4].parse().unwrap();
 
-                            let time_result: Result<DateTime<Utc>, _> = time.try_into();
-                            match time_result {
-                                Ok(time) => {
-                                    info!("GPS TIME (UTC): {:?}", time);
-                                }
-                                Err(_) => {
-                                    error!("Failed to parse GPS time");
-                                }
-                            }
-                        }
-                    },
-                    _ => {
-                        println!("{:?}", packet);
-                    },
-                })
-                .unwrap();
+                    info!("TELEMETRY: Lat {:.5} Long {:5} Alt {:.2} m Spd {:.2} m/s Head {:.2} deg", lat, lon, alt, speed, heading);
 
-            if Instant::now() > last_packet + Duration::from_millis(600 * 1000) && !state.read().expect("shared state read").cut_done
-            {
-                info!("No GPS for over 10 minutes! Cutting down.");
-                gpio_actions.send(GpioAction::Drop(None)).expect("gpio action channel to be open");
-            }
-        }
-
-        info!("GPS Shutdown");
-    });
-}
-
-fn get_all_mpu(mpu: &mut Mpu9250Device) -> Result<(f32, (f32, f32, f32), (f32, f32, f32)), rppal::spi::Error> {
-    let readings = mpu.all()?;
-    Ok( (readings.temp, readings.gyro, readings.accel) )
-}
-
-fn get_baro_readings(baro: &mut Bmp280) -> Result<(f32, f32, f32), rppal::i2c::Error> {
-    let temp = baro.temperature_celsius()?;
-    let pressure = baro.pressure_kpa()?;
-    let altitude = baro.altitude_m()?;
-    Ok( (temp, pressure, altitude) )
-}
-
-fn get_gps_readings(gps_rx: Receiver<(f32, f32, f32)>) -> Option<(f32, f32, f32)> {
-    let mut lat = 0.0;
-    let mut lon = 0.0;
-    let mut alt = 0.0;
-
-    result = gps_rx.try_recv();
-    match Result {
-        Ok((lat, lon, alt)) => {
-            info!("GPS: Lat {:.5} Long {:5} Alt {:.2} m", lat, lon, alt);
-        }
-        Err(mpsc::TryRecvError::Empty) => {
-            // No data available
-            return None;
-        }
-        Err(mpsc::TryRecvError::Disconnected) => {
-            // Channel disconnected
-            return None;
-        }        
-    }
-
-    Ok( (lat, lon, alt) )
-}
-
-#[derive(Debug)]
-enum GpsError {
-    SerialError(serialport::Error),
-}
-
-fn initialize_gps() -> Result<GPSDevice, GpsError> {
-    let builder = serialport::new("/dev/ttyS0", 9600)
-        .flow_control(serialport::FlowControl::None)
-        .data_bits(serialport::DataBits::Eight)
-        .stop_bits(serialport::StopBits::One)
-        .open()
-        .map_err(|e| GpsError::SerialError(e))?;
-
-    let mut device = GPSDevice::new(builder);
-
-    // Configure the device to talk UBX
-    debug!("Configuring UART1 port ...");
-    device
-        .write_with_ack::<CfgPrtUart>(
-            &CfgPrtUartBuilder {
-                portid: UartPortId::Uart1,
-                reserved0: 0,
-                tx_ready: 0,
-                mode: UartMode::new(DataBits::Eight, Parity::None, StopBits::One),
-                baud_rate: 9600,
-                in_proto_mask: InProtoMask::UBLOX,
-                out_proto_mask: OutProtoMask::union(OutProtoMask::NMEA, OutProtoMask::UBLOX),
-                flags: 0,
-                reserved5: 0,
-            }
-            .into_packet_bytes(),
-        )
-        .expect("Could not configure UBX-CFG-PRT-UART");
-    // TODO: Make retries automatic
-    // device
-    //     .wait_for_ack::<CfgPrtUart>()
-    //     .expect("Could not acknowledge UBX-CFG-PRT-UART msg");
-
-    // Enable the NavPvt packet
-    device
-        .write_with_ack::<CfgMsgAllPorts>(
-            &CfgMsgAllPortsBuilder::set_rate_for::<NavPvt>([0, 1, 0, 0, 0, 0]).into_packet_bytes(),
-        )
-        .expect("Could not configure ports for UBX-NAV-PVT");
-    // device
-    //     .wait_for_ack::<CfgMsgAllPorts>()
-    //     .expect("Could not acknowledge UBX-CFG-PRT-UART msg");
-
-    // Send a packet request for the MonVer packet
-    device
-        .write_all(&UbxPacketRequest::request_for::<MonVer>().into_packet_bytes())
-        .expect("Unable to write request/poll for UBX-MON-VER message");
-
-    // Start reading data
-    debug!("Opened uBlox device, waiting for messages...");
-
-    Ok(device)
-}
-
-// Shamelessly copied https://github.com/ublox-rs/ublox/blob/master/examples/basic_cli/src/main.rs
-pub struct GPSDevice {
-    port: Box<dyn serialport::SerialPort>,
-    parser: Parser<Vec<u8>>,
-}
-
-const UART_TIMEOUT: Duration = Duration::from_millis(1000);
-const UART_RETRIES: usize = 10;
-
-impl GPSDevice {
-    pub fn new(port: Box<dyn serialport::SerialPort>) -> GPSDevice {
-        let parser = Parser::default();
-        GPSDevice { port, parser }
-    }
-
-    pub fn write_with_ack<T: UbxPacketMeta>(&mut self, data: &[u8]) -> std::io::Result<()> {
-        // First write the packet
-        self.write_all(data)?;
-
-        // Start waiting for ACK, allowing retries until max is hit
-        let mut attempts = 0;
-        while attempts < UART_RETRIES {
-            match self.wait_for_ack::<T>() {
-                Ok(()) => return Ok(()),
-                Err(e) => match e.kind() {
-                    ErrorKind::TimedOut => {
-                        // Didn't receive packet, try again
-                        self.write_all(data)?;
-                        attempts += 1;
-                    }
-                    _ => return Err(e),
-                },
-            }
-        }
-
-        Err(std::io::Error::from(ErrorKind::TimedOut))
-    }
-
-    pub fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.port.write_all(data)
-    }
-
-    pub fn update<T: FnMut(PacketRef)>(&mut self, mut cb: T) -> std::io::Result<()> {
-        loop {
-            const MAX_PAYLOAD_LEN: usize = 1240;
-            let mut local_buf = [0; MAX_PAYLOAD_LEN];
-            let nbytes = self.read_port(&mut local_buf)?;
-            if nbytes == 0 {
-                break;
-            }
-
-            // parser.consume adds the buffer to its internal buffer, and
-            // returns an iterator-like object we can use to process the packets
-            let mut it = self.parser.consume(&local_buf[..nbytes]);
-            loop {
-                match it.next() {
-                    Some(Ok(packet)) => {
-                        cb(packet);
-                    }
-                    Some(Err(_)) => {
-                        // Received a malformed packet, ignore it
-                    }
-                    None => {
-                        // We've eaten all the packets we have
-                        break;
-                    }
+                    gps_tx.send((lat, lon, alt)).unwrap();
                 }
             }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        Ok(())
-    }
+    })
 
-    pub fn wait_for_ack<T: UbxPacketMeta>(&mut self) -> std::io::Result<()> {
-        let mut found_packet = false;
-        let start = Instant::now();
-        while !found_packet {
-            self.update(|packet| {
-                if let PacketRef::AckAck(ack) = packet {
-                    if ack.class() == T::CLASS && ack.msg_id() == T::ID {
-                        found_packet = true;
-                    }
-                }
-            })?;
+    (MpuData::new(mpu_file), BaroData::new(baro_file), gps_rx)
+}
 
-            if start.elapsed() > UART_TIMEOUT && !found_packet {
-                return Err(std::io::Error::from(ErrorKind::TimedOut));
+pub struct BaroData {
+    file_contents: Vec<(f32, f32, f32)>,
+    line: usize,
+}
+
+impl BaroData {
+    pub fn new(file: File) -> BaroData {
+        let mut file_contents_string = String::new();
+        file.read_to_string(&mut file_contents_string).unwrap();
+
+        let mut contents = Vec::new();
+        for line in contents.split('\n') {
+            let line = line.unwrap();
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 3 {
+                let temperature: f32 = parts[0].parse().unwrap();
+                let pressure: f32 = parts[1].parse().unwrap();
+                let altitude: f32 = parts[2].parse().unwrap();
+                contents.push((temperature, pressure, altitude));
             }
         }
-        Ok(())
+
+        BaroData {
+            file_contents: contents,
+            line: 0,
+        }
     }
 
-    /// Reads the serial port, converting timeouts into "no data received"
-    fn read_port(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        match self.port.read(output) {
-            Ok(b) => Ok(b),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::TimedOut {
-                    Ok(0)
-                } else {
-                    Err(e)
-                }
+    pub fn log_next_reading(&mut self) -> (f32, f32, f32) {
+        self.line += 1;
+        if self.line < self.file_contents.len() {
+            self.file_contents[self.line]
+        } else {
+            self.line = 0;
+            self.file_contents[self.line]
+        }
+    }
+}
+
+pub struct MpuData {
+    file_contents: Vec<(f32, (f32, f32, f32), (f32, f32, f32))>,
+    line: usize,
+}
+
+impl MpuData {
+    pub fn new(file: File) -> MpuData {
+        let mut file_contents_string = String::new();
+        file.read_to_string(&mut file_contents_string).unwrap();
+
+        let mut contents = Vec::new();
+        for line in contents.split('\n') {
+            let line = line.unwrap();
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 3 {
+                let mut accel: (f32, f32, f32);
+                let mut gyro: (f32, f32, f32);
+
+                let temperature: f32 = parts[0].parse().unwrap();
+
+                accel.0 = parts[1].parse().unwrap();
+                accel.1 = parts[2].parse().unwrap();
+                accel.2 = parts[3].parse().unwrap();
+
+                gyro.0 = parts[4].parse().unwrap();
+                gyro.1 = parts[5].parse().unwrap();
+                gyro.2 = parts[6].parse().unwrap();
+
+                contents.push((temperature, accel, gyro));
             }
+        }
+
+        MpuData {
+            file_contents: contents,
+            line: 0,
+        }
+    }
+
+    pub fn log_next_reading(&mut self) -> (f32, (f32, f32, f32), (f32, f32, f32)) {
+        self.line += 1;
+        if self.line < self.file_contents.len() {
+            self.file_contents[self.line]
+        } else {
+            self.line = 0;
+            self.file_contents[self.line]
+        }
+    }
+}
+
+pub fn poll_mpu(mpu_data: &mut MpuData) -> (f32, f32, f32) {
+    (_, accel, _) = mpu_data.log_next_reading();
+    accel
+}
+pub fn poll_barometer(baro_data: &mut BaroData) -> (f32, f32) {
+    (_, _, altitude) = baro_data.log_next_reading();
+    altitude
+}
+
+pub fn poll_gps(gps_rx: &mut Receiver<(f32, f32, f32)>) -> Option<(f32, f32, f32)> {
+    match gps_rx.try_recv() {
+        Ok(data) => {
+            Some(data)
+        }
+        Err(TryRecvError::Empty) => {
+            None
+        }
+        Err(TryRecvError::Disconnected) => {
+            error!("GPS thread disconnected");
+            None
         }
     }
 }
