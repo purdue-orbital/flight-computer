@@ -95,6 +95,8 @@ fn find_sink_rate(mut state: ResMut<State>){ // Use the ends of the barometric a
         state.barometric_timestamps[LOGGED_ALTS - 1].duration_since(state.barometric_timestamps[0]).as_secs_f32()); 
         //Average this w/ the previous value.
         // We don't want a sudden spike causing something to get kippered up. That can still happen, but it's less likely this way.
+        // EDIT 02-APR-2025: This should actually be even less likely now, since there's a new filter implemented on the initial input
+        // of barometry data (upon which everything else is based). Still, I'm keeping this code here - redundancy is good, right?
     new_rate = state.sink_rates[LOGGED_ALTS - 1];
     info!("Vertical Velocity: {new_rate}.\n");
 }
@@ -106,12 +108,18 @@ fn barometer(mut state: ResMut<State>, mut baro: ResMut<BaroData>){ // Read the 
     for i in 1..state.barometric_alts.len(){
         state.barometric_alts[i - 1] = state.barometric_alts[i];
     }
-    state.barometric_alts[state.barometric_alts.len()] = 
-    (read_value + 
-    state.barometric_alts[state.barometric_alts.len() - 1] +
-    state.barometric_alts[state.barometric_alts.len() - 2] +
-    state.barometric_alts[state.barometric_alts.len() - 3] ) / 4.0;
-    // Averaging again, as an anti-kippering mechanism. This time in quadruplicate.
+    let prev_avg = 
+    (state.barometric_alts[state.barometric_alts.len() - 2] +
+    state.barometric_alts[state.barometric_alts.len() - 3] +
+    state.barometric_alts[state.barometric_alts.len() - 4] ) / 3.0;
+    // Take the average of the previous three values, so that we can filter out sudden spikes.
+
+    let filter_const = 1.1.powf(-(read_value - prev_avg)); //This constant controls how much the current value should be "trusted".
+    // If it's very high compared to the average of the prior values, then this constant will evaluate to a low value.
+    // Turn the constant (1.1 here) higher in order to be more strict about it, and lower to be more lax.
+
+    let new_rate = prev_avg + filter_const * (read_value - prev_avg);
+    state.barometric_alts[state.barometric_alts.len() - 1] = new_rate;
 
     info!("Barometric Pressure: {new_rate}.\n");
 
@@ -166,6 +174,10 @@ fn grounded_tasks(state: &State) -> FlightStates{
         return FlightStates::Ascending;
     }
 }
+
+const LAUNCH_ALTITUDE: f32 = 0.0;
+const POP_ALTITUDE: f32 = 0.0;
+const RELEASE_ALTITUDE: f32 = 0.0;
 
 fn ascending_tasks(state: &State, has_done: &Signals) -> FlightStates{
     let signals = Signals{
