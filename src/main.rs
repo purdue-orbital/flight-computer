@@ -19,6 +19,7 @@ enum FlightStates{
 
 enum Commands{
     LaunchRocket,
+    LetDown,
     PopBalloon,
     ReleaseBalloon,
     CutDown,
@@ -38,6 +39,7 @@ struct State {
 
 struct Signals {
     launch_rocket: bool,
+    let_down: bool,
     pop_balloon: bool,
     release_balloon: bool,
     cut_down: bool,
@@ -57,6 +59,7 @@ fn main() {
 
     let has_done = Signals{
         launch_rocket: false,
+        let_down: false,
         pop_balloon: false,
         release_balloon: false,
         cut_down: false,
@@ -178,32 +181,37 @@ fn grounded_tasks(state: &State) -> FlightStates{
 const LAUNCH_ALTITUDE: f32 = 0.0;
 const POP_ALTITUDE: f32 = 0.0;
 const RELEASE_ALTITUDE: f32 = 0.0;
+const LET_DOWN_ALTITUDE: f32 = 0.0;
 
 fn ascending_tasks(state: &State, has_done: &Signals) -> FlightStates{
     let signals = Signals{
         launch_rocket: false,
+        let_down: false,
         pop_balloon: false,
         release_balloon: false,
         cut_down: false,
     }; //In futuro, this will come from some other piece of code, but I'm defining it manually here (all-false) as a temporary measure.
     // Just remember that none of the code oughta mutate it!
 
-    if (state.barometric_alts >= LAUNCH_ALTITUDE || signals.launch_rocket && !has_done.launch_rocket){
+    if (state.barometric_alts[LOGGED_ALTS - 1] >= LET_DOWN_ALTITUDE && !has_done.let_down){
+        info!("Letting down...");
+        send_command_to_board(Commands::LetDown, 0);
+        has_done.let_down = true;
+    }
+    if (state.barometric_alts[LOGGED_ALTS - 1] >= LAUNCH_ALTITUDE || signals.launch_rocket && !has_done.launch_rocket){
         info!("Either we just reached launching altitude, or we got a signal from the ground. Anyway, we're launching!");
         send_command_to_board(Commands::LaunchRocket, 0);
         has_done.launch_rocket = true;
     }
-    if (has_done.launch_rocket){ //These check that we're *below* a certain barom. alt. - but shouldn't be done 'till the rocket goes!
-        if (state.barometric_alts[LOGGED_ALTS - 1] <= POP_ALTITUDE || signals.pop_balloon && !has_done.pop_balloon){
-            info!("We're popping the balloon!");
-            send_command_to_board(Commands::PopBalloon, 0);
-            has_done.pop_balloon = true;
-        }
-        if (state.barometric_alts[LOGGED_ALTS - 1] <= RELEASE_ALTITUDE || signals.release_balloon && !has_done.release_balloon){
-            info!("Letting the balloon go!");
-            send_command_to_board(Commands::ReleaseBalloon, 0);
-            has_done.release_balloon = true;
-        }
+    if ((state.barometric_alts[LOGGED_ALTS - 1] <= POP_ALTITUDE && has_done.launch_rocket) || signals.pop_balloon && !has_done.pop_balloon){
+        info!("We're popping the balloon!");
+        send_command_to_board(Commands::PopBalloon, 0);
+         has_done.pop_balloon = true;
+    }
+    if ((state.barometric_alts[LOGGED_ALTS - 1] <= RELEASE_ALTITUDE && has_done.launch_rocket) || signals.release_balloon && !has_done.release_balloon){
+        info!("Letting the balloon go!");
+        send_command_to_board(Commands::ReleaseBalloon, 0);
+        has_done.release_balloon = true;
     }
     if (signals.cut_down && !has_done.cut_down){
         send_command_to_board(Commands::CutDown, 0);
