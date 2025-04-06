@@ -32,8 +32,9 @@ pub fn init_sensors() -> (MpuData, BaroData, Receiver<(f32, f32, f32)>) {
                     let alt: f32 = parts[2].parse().unwrap();
                     let speed: f32 = parts[3].parse().unwrap();
                     let heading: f32 = parts[4].parse().unwrap();
+                    let time: f32 = parts[5].parse().unwrap();
 
-                    info!("TELEMETRY: Lat {:.5} Long {:5} Alt {:.2} m Spd {:.2} m/s Head {:.2} deg", lat, lon, alt, speed, heading);
+                    info!("TELEMETRY: Time: {:.5} Lat {:.5} Long {:5} Alt {:.2} m Spd {:.2} m/s Head {:.2} deg", time, lat, lon, alt, speed, heading);
 
                     gps_tx.send((lat, lon, alt)).unwrap();
                 }
