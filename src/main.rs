@@ -20,9 +20,9 @@ enum FlightStates{
 enum Commands{
     LaunchRocket,
     LetDown,
-    PopBalloon,
-    ReleaseBalloon,
-    CutDown,
+    ActivateGNC,
+    CutDown1,
+    CutDown2,
 }
 
 const LOGGED_ALTS: usize = 20;
@@ -32,17 +32,18 @@ struct State {
     state: FlightStates, // The current flight state.
     barometric_alts: [f32; LOGGED_ALTS], // The last twenty read barometric altitudes.
     barometric_timestamps: [Instant; LOGGED_ALTS], // The timestamps these altitudes were read at (should be uniform, but you never know!)
+    gnc_activation_timestamp: Instant,
     sink_rates: [f32; LOGGED_ALTS], // The calculated vertical velocity from the previous two entries.
     location: (f32, f32, f32), // The location last polled from the GPS.
     acceleration: (f32, f32, f32), // The acceleration last polled from the IMUs.
 }
 
 struct Signals {
+    gnc_activation: bool,
     launch_rocket: bool,
     let_down: bool,
-    pop_balloon: bool,
-    release_balloon: bool,
-    cut_down: bool,
+    cut_down_1: bool,
+    cut_down_2: bool,
 }
 
 fn main() {
@@ -52,17 +53,18 @@ fn main() {
         state: FlightStates::Init, 
         barometric_alts: [0.0; LOGGED_ALTS],
         barometric_timestamps: [Instant::now(); LOGGED_ALTS],
+        gnc_activation_timestamp: Instant::now(),
         sink_rates: [0.0; LOGGED_ALTS],
         location: (0.0, 0.0, 0.0),
         acceleration: (0.0, 0.0, 0.0),
     };
 
     let has_done = Signals{
+        gnc_activation: false,
         launch_rocket: false,
         let_down: false,
-        pop_balloon: false,
-        release_balloon: false,
-        cut_down: false,
+        cut_down_1: false,
+        cut_down_2: false,
     };
 
     let (mpu, baro, gps) = init_sensors();
@@ -165,12 +167,12 @@ const POLL_FREQ: u128 = 10000; //Frequency of polling in microseconds (10000 = 1
 
 const LIFTOFF_DETECTION_RATE: i32 = 10;
 
-fn init_tasks(state: &State) -> FlightStates{ //...What do we need to do here?
+fn init_tasks(mut state: ResMut<State>) -> FlightStates{ //...What do we need to do here?
     return FlightStates::Grounded;
 }
 
-fn grounded_tasks(state: &State) -> FlightStates{
-    if (state.acceleration <= LIFTOFF_DETECTION_RATE || state.sink_rate <= LIFTOFF_DETECTION_RATE){
+fn grounded_tasks(mut state: ResMut<State>) -> FlightStates{
+    if (state.acceleration <= LIFTOFF_DETECTION_RATE || state.sink_rates[LOGGED_ALTS - 1] <= LIFTOFF_DETECTION_RATE){
         return state.state;
     } else {
         info!("Launch detected! Transitioning to ascending state.");
@@ -178,49 +180,57 @@ fn grounded_tasks(state: &State) -> FlightStates{
     }
 }
 
-const LAUNCH_ALTITUDE: f32 = 0.0;
-const POP_ALTITUDE: f32 = 0.0;
-const RELEASE_ALTITUDE: f32 = 0.0;
+const GNC_ALTITUDE: f32 = 5000.0;
+const CUT_DOWN_ALTITUDE: f32 = 0.0;
 const LET_DOWN_ALTITUDE: f32 = 0.0;
 
-fn ascending_tasks(state: &State, has_done: &Signals) -> FlightStates{
-    let signals = Signals{
+fn ascending_tasks(mut state: ResMut<State>, mut has_done: ResMut<Signals>) -> FlightStates{
+    /*let signals = Signals{
         launch_rocket: false,
         let_down: false,
-        pop_balloon: false,
-        release_balloon: false,
-        cut_down: false,
+        cut_down_1: false,
+        cut_down_2: false,
     }; //In futuro, this will come from some other piece of code, but I'm defining it manually here (all-false) as a temporary measure.
-    // Just remember that none of the code oughta mutate it!
+    // Just remember that none of the code oughta mutate it!*/
+    
+    if (state.barometric_alts[LOGGED_ALTS - 1] >= GNC_ALTITUDE && !has_done.gnc_activation){
+        send_command_to_board(Commands::ActivateGNC, 0);
+        state.gnc_activation_timestamp = Instant::now();
+        info!("GNC Activation altitude reached!");
+        has_done.gnc_activation = true;
+    }
 
-    if (state.barometric_alts[LOGGED_ALTS - 1] >= LET_DOWN_ALTITUDE && !has_done.let_down){
-        info!("Letting down...");
-        send_command_to_board(Commands::LetDown, 0);
-        has_done.let_down = true;
+    if (has_done.gnc_activation && !has_done.launch_rocket){
+        if (Instant::now().duration_since(state.gnc_activation_timestamp).as_secs() > 15) {
+            send_command_to_board(Commands::LaunchRocket, 0);
+            has_done.launch_rocket = true;
+        }
     }
-    if (state.barometric_alts[LOGGED_ALTS - 1] >= LAUNCH_ALTITUDE || signals.launch_rocket && !has_done.launch_rocket){
-        info!("Either we just reached launching altitude, or we got a signal from the ground. Anyway, we're launching!");
-        send_command_to_board(Commands::LaunchRocket, 0);
-        has_done.launch_rocket = true;
-    }
-    if ((state.barometric_alts[LOGGED_ALTS - 1] <= POP_ALTITUDE && has_done.launch_rocket) || signals.pop_balloon && !has_done.pop_balloon){
-        info!("We're popping the balloon!");
-        send_command_to_board(Commands::PopBalloon, 0);
-         has_done.pop_balloon = true;
-    }
-    if ((state.barometric_alts[LOGGED_ALTS - 1] <= RELEASE_ALTITUDE && has_done.launch_rocket) || signals.release_balloon && !has_done.release_balloon){
-        info!("Letting the balloon go!");
-        send_command_to_board(Commands::ReleaseBalloon, 0);
-        has_done.release_balloon = true;
-    }
-    if (signals.cut_down && !has_done.cut_down){
-        send_command_to_board(Commands::CutDown, 0);
-        has_done.cut_down = true;
+
+    if (has_done.launch_rocket){
+        if (state.barometric_alts[LOGGED_ALTS - 1] >= LET_DOWN_ALTITUDE && !has_done.let_down){
+            info!("Letting down...");
+            send_command_to_board(Commands::LetDown, 0);
+            has_done.let_down = true;
+        }
+        if (has_done.cut_down_1){
+            if (state.sink_rates[LOGGED_ALTS - 1] >= 0 && state.barometric_alts[LOGGED_ALTS - 1] >= CUT_DOWN_ALTITUDE){
+                info!("Still rising after first cut down, doing second...");
+                send_command_to_board(Commands::CutDown2, 0);
+                has_done.cut_down_2 = true;
+            }
+        } else {
+            if (state.barometric_alts[LOGGED_ALTS - 1] >= CUT_DOWN_ALTITUDE){
+                info!("Cutting down...");
+                send_command_to_board(Commands::CutDown1, 0);
+                has_done.cut_down_1 = true;
+            }
+        }
     }
     return state.state;
 }
 
-fn post_cut_tasks(state: &State) -> FlightStates{
+fn post_cut_tasks(mut state: ResMut<State>) -> FlightStates{
     if (state.sink_rates[LOGGED_ALTS - 1] - state.sink_rates[LOGGED_ALTS - 2]) 
     + (state.sink_rates[LOGGED_ALTS - 2] - state.sink_rates[LOGGED_ALTS - 3]).abs() <= 0.1{
         info!("Constant vertical descent rate reached, transitioning to descent phase...");
@@ -229,7 +239,7 @@ fn post_cut_tasks(state: &State) -> FlightStates{
     return state.state;
 }
 
-fn descending_tasks(state: &State) -> FlightStates{
+fn descending_tasks(mut state: ResMut<State>) -> FlightStates{
     if (state.sink_rates[LOGGED_ALTS - 1] + state.sink_rates[LOGGED_ALTS - 2]) 
     + state.sink_rates[LOGGED_ALTS - 3] <= 0.1{
         info!("Landing detected!");
@@ -238,7 +248,7 @@ fn descending_tasks(state: &State) -> FlightStates{
     return state.state;
 }
 
-fn landed_tasks(state: &State) -> FlightStates{
+fn landed_tasks(mut state: ResMut<State>) -> FlightStates{
     return state.state;
 }
 
