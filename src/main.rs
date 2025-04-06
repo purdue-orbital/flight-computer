@@ -1,6 +1,7 @@
 use flight_builder::prelude::*;
 use flight_computer::poll_gps;
 use std::{ptr::read, time::{Duration, Instant}};
+use flexi_logger;
 use log::*;
 
 #[derive(Copy, Clone)]
@@ -47,6 +48,7 @@ struct Signals {
 }
 
 fn main() {
+    flexi_logger::Logger::try_with_env_or_str("info")?.start()?;
     let mut s = Scheduler::new(); //Create a scheduling object.
 
     let state = State{ // Initialize a state object.
@@ -180,9 +182,9 @@ fn grounded_tasks(mut state: ResMut<State>) -> FlightStates{
     }
 }
 
-const GNC_ALTITUDE: f32 = 5000.0;
-const CUT_DOWN_ALTITUDE: f32 = 0.0;
-const LET_DOWN_ALTITUDE: f32 = 0.0;
+const GNC_ALTITUDE: f32 = (5000.0 / 3.2808);
+const CUT_DOWN_ALTITUDE: f32 = (5000.0 / 3.2808);
+const LET_DOWN_ALTITUDE: f32 = (5000.0 / 3.2808);
 
 fn ascending_tasks(mut state: ResMut<State>, mut has_done: ResMut<Signals>) -> FlightStates{
     /*let signals = Signals{
@@ -202,6 +204,7 @@ fn ascending_tasks(mut state: ResMut<State>, mut has_done: ResMut<Signals>) -> F
 
     if (has_done.gnc_activation && !has_done.launch_rocket){
         if (Instant::now().duration_since(state.gnc_activation_timestamp).as_secs() > 15) {
+            info!("Rocket launched!");
             send_command_to_board(Commands::LaunchRocket, 0);
             has_done.launch_rocket = true;
         }
